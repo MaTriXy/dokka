@@ -5,6 +5,7 @@ import com.google.inject.Singleton
 import com.intellij.psi.PsiMethod
 import com.intellij.util.io.*
 import org.jetbrains.kotlin.descriptors.*
+import org.jetbrains.kotlin.descriptors.impl.EnumEntrySyntheticClassDescriptor
 import org.jetbrains.kotlin.load.java.descriptors.JavaCallableMemberDescriptor
 import org.jetbrains.kotlin.load.java.descriptors.JavaClassDescriptor
 import org.jetbrains.kotlin.load.java.descriptors.JavaMethodDescriptor
@@ -15,7 +16,9 @@ import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameSafe
 import org.jetbrains.kotlin.resolve.descriptorUtil.parents
 import java.io.ByteArrayOutputStream
 import java.io.PrintWriter
+import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLConnection
 import java.nio.file.Path
 import java.security.MessageDigest
 
@@ -30,11 +33,43 @@ class ExternalDocumentationLinkResolver @Inject constructor(
     val packageFqNameToLocation = mutableMapOf<FqName, ExternalDocumentationRoot>()
     val formats = mutableMapOf<String, InboundExternalLinkResolutionService>()
 
-    class ExternalDocumentationRoot(val rootUrl: URL, val resolver: InboundExternalLinkResolutionService, val locations: Map<String, String>)
+    class ExternalDocumentationRoot(val rootUrl: URL, val resolver: InboundExternalLinkResolutionService, val locations: Map<String, String>) {
+        override fun toString(): String = rootUrl.toString()
+    }
 
     val cacheDir: Path? = options.cacheRoot?.resolve("packageListCache")?.apply { createDirectories() }
 
     val cachedProtocols = setOf("http", "https", "ftp")
+
+    fun URL.doOpenConnectionToReadContent(timeout: Int = 10000, redirectsAllowed: Int = 16): URLConnection {
+        val connection = this.openConnection()
+        connection.connectTimeout = timeout
+        connection.readTimeout = timeout
+
+        when (connection) {
+            is HttpURLConnection -> {
+                return when (connection.responseCode) {
+                    in 200..299 -> {
+                        connection
+                    }
+                    HttpURLConnection.HTTP_MOVED_PERM,
+                    HttpURLConnection.HTTP_MOVED_TEMP,
+                    HttpURLConnection.HTTP_SEE_OTHER -> {
+                        if (redirectsAllowed > 0) {
+                            val newUrl = connection.getHeaderField("Location")
+                            URL(newUrl).doOpenConnectionToReadContent(timeout, redirectsAllowed - 1)
+                        } else {
+                            throw RuntimeException("Too many redirects")
+                        }
+                    }
+                    else -> {
+                        throw RuntimeException("Unhandled http code: ${connection.responseCode}")
+                    }
+                }
+            }
+            else -> return connection
+        }
+    }
 
     fun loadPackageList(link: DokkaConfiguration.ExternalDocumentationLink) {
 
@@ -50,7 +85,7 @@ class ExternalDocumentationLinkResolver @Inject constructor(
 
             if (cacheEntry.exists()) {
                 try {
-                    val connection = packageListUrl.openConnection()
+                    val connection = packageListUrl.doOpenConnectionToReadContent()
                     val originModifiedDate = connection.date
                     val cacheDate = cacheEntry.lastModified().toMillis()
                     if (originModifiedDate > cacheDate || originModifiedDate == 0L) {
@@ -60,7 +95,7 @@ class ExternalDocumentationLinkResolver @Inject constructor(
                             logger.info("Renewing package-list from $packageListUrl")
                         connection.getInputStream().copyTo(cacheEntry.outputStream())
                     }
-                } catch(e: Exception) {
+                } catch (e: Exception) {
                     logger.error("Failed to update package-list cache for $link")
                     val baos = ByteArrayOutputStream()
                     PrintWriter(baos).use {
@@ -75,7 +110,7 @@ class ExternalDocumentationLinkResolver @Inject constructor(
             }
             cacheEntry.inputStream()
         } else {
-            packageListUrl.openStream()
+            packageListUrl.doOpenConnectionToReadContent().getInputStream()
         }
 
         val (params, packages) =
@@ -144,7 +179,9 @@ interface InboundExternalLinkResolutionService {
 
     class Javadoc : InboundExternalLinkResolutionService {
         override fun getPath(symbol: DeclarationDescriptor): String? {
-            if (symbol is JavaClassDescriptor) {
+            if (symbol is EnumEntrySyntheticClassDescriptor) {
+                return getPath(symbol.containingDeclaration)?.let { it + "#" + symbol.name.asString() }
+            } else if (symbol is JavaClassDescriptor) {
                 return DescriptorUtils.getFqName(symbol).asString().replace(".", "/") + ".html"
             } else if (symbol is JavaCallableMemberDescriptor) {
                 val containingClass = symbol.containingDeclaration as? JavaClassDescriptor ?: return null
@@ -177,13 +214,11 @@ interface InboundExternalLinkResolutionService {
             else return "$path/index.$extension"
         }
 
-        fun getPathWithoutExtension(symbol: DeclarationDescriptor): String {
-            if (symbol.containingDeclaration == null)
-                return identifierToFilename(symbol.name.asString())
-            else if (symbol is PackageFragmentDescriptor) {
-                return symbol.fqName.asString()
-            } else {
-                return getPathWithoutExtension(symbol.containingDeclaration!!) + '/' + identifierToFilename(symbol.name.asString())
+        private fun getPathWithoutExtension(symbol: DeclarationDescriptor): String {
+            return when {
+                symbol.containingDeclaration == null -> identifierToFilename(symbol.name.asString())
+                symbol is PackageFragmentDescriptor -> identifierToFilename(symbol.fqName.asString())
+                else -> getPathWithoutExtension(symbol.containingDeclaration!!) + '/' + identifierToFilename(symbol.name.asString())
             }
         }
 
