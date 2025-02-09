@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE vars
+        SYSTEM "https://resources.jetbrains.com/stardust/vars.dtd">
+
+<vars>
+    <var name="dokkaVersion"
+         value="2.0.0"
+         type="string"/>
+    <var name="kotlinVersion"
+         value="2.1.0"
+         type="string"/>
+</vars>
